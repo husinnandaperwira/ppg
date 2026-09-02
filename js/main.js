@@ -92,13 +92,36 @@
   };
 
   const setActiveNavLinkByHash = (hash) => {
-    if (!hash || !hash.startsWith('#')) return;
+    if (!hash || !hash.startsWith('#')) return false;
 
     const navLinks = Array.from(document.querySelectorAll('.nav-link[href^="#"]'));
     for (const a of navLinks) a.classList.remove('is-active');
 
     const active = navLinks.find((a) => (a.getAttribute('href') || '') === hash);
-    if (active) active.classList.add('is-active');
+    if (active) {
+      active.classList.add('is-active');
+      return true;
+    }
+    return false;
+  };
+
+  const setActiveNavLinkById = (id) => {
+    if (!id) return false;
+    const navLinks = Array.from(document.querySelectorAll('.nav-link[href^="#"]'));
+    let changed = false;
+    for (const a of navLinks) {
+      const match = (a.getAttribute('href') || '') === `#${id}`;
+      if (match) {
+        if (!a.classList.contains('is-active')) {
+          changed = true;
+          a.classList.add('is-active');
+        }
+      } else if (a.classList.contains('is-active')) {
+        changed = true;
+        a.classList.remove('is-active');
+      }
+    }
+    return changed;
   };
 
   const initNavLinks = () => {
@@ -125,49 +148,137 @@
   const initScrollSpy = () => {
     const navLinks = Array.from(document.querySelectorAll('.nav-link[href^="#"]'));
     const sections = navLinks
-      .map((a) => document.querySelector(a.getAttribute('href')))
+      .map((a) => {
+        const href = a.getAttribute('href') || '';
+        return href && href.startsWith('#') ? document.querySelector(href) : null;
+      })
       .filter(Boolean);
 
-    if (!navLinks.length || !sections.length || !('IntersectionObserver' in window)) return;
+    if (!navLinks.length || !sections.length) return;
 
     const byId = new Map(
       navLinks.map((a) => [a.getAttribute('href')?.slice(1), a])
     );
+    const orderedIds = sections.map((s) => s.id).filter(Boolean);
 
-    const clearActive = () => {
+    let lastActiveId = null;
+    const setActive = (id, { force = false } = {}) => {
+      if (!id) return;
+      if (!force && id === lastActiveId) return;
+      lastActiveId = id;
+
       for (const a of navLinks) a.classList.remove('is-active');
+      const link = byId.get(id);
+      if (link) link.classList.add('is-active');
     };
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => (b.intersectionRatio || 0) - (a.intersectionRatio || 0));
+    const buildOptions = () => ({
+      root: null,
+      threshold: [0.05, 0.15, 0.3, 0.5, 0.75],
+      rootMargin: `-${Math.round(getHeaderOffset() + 8)}px 0px -42% 0px`,
+    });
 
-        if (!visible.length) return;
-        const id = visible[0].target?.id;
-        if (!id) return;
+    const findActiveByScroll = () => {
+      const offset = getHeaderOffset() + 16;
+      const viewportMid = window.innerHeight * 0.45;
+      // Pilih section yang top-nya sudah "masuk viewport" dan paling dekat dengan mid-line header-ish.
+      let bestId = null;
+      let bestScore = Infinity;
 
-        clearActive();
-        const link = byId.get(id);
-        if (link) link.classList.add('is-active');
-      },
-      {
-        root: null,
-        threshold: [0.2, 0.35, 0.5],
-        rootMargin: `-${Math.round(getHeaderOffset())}px 0px -55% 0px`,
+      for (const sec of sections) {
+        const rect = sec.getBoundingClientRect();
+        if (rect.bottom <= offset) continue; // section sudah lewat sepenuhnya di atas
+        // Jarak titik tengah section terhadap mid viewport
+        const sectionMid = rect.top + Math.min(180, rect.height / 2);
+        const distance = Math.abs(sectionMid - viewportMid);
+        // Bonus: jika top section tepat di atas offset -> lebih diutamakan
+        const topPenalty = rect.top > offset ? 0 : (offset - rect.top) * 0.5;
+        const score = distance + topPenalty;
+        if (score < bestScore) {
+          bestScore = score;
+          bestId = sec.id;
+        }
       }
-    );
 
-    for (const s of sections) observer.observe(s);
+      // Fallback untuk section paling bawah (footer/kontak) jika scroll sudah paling bawah
+      if (!bestId && orderedIds.length) {
+        const atBottom = (window.innerHeight + Math.round(window.scrollY)) >= (document.documentElement.scrollHeight - 4);
+        if (atBottom) bestId = orderedIds[orderedIds.length - 1];
+      }
+
+      return bestId;
+    };
+
+    let scrollTicking = false;
+    const onScrollTick = () => {
+      scrollTicking = false;
+      const id = findActiveByScroll();
+      if (id) setActive(id);
+    };
+
+    const onScroll = () => {
+      if (scrollTicking) return;
+      scrollTicking = true;
+      // requestAnimationFrame agar tidak thrashing
+      if ('requestAnimationFrame' in window) requestAnimationFrame(onScrollTick);
+      else setTimeout(onScrollTick, 16);
+    };
+
+    const useObserver = 'IntersectionObserver' in window;
+    let observer = null;
+    let lastObservedId = null;
+
+    if (useObserver) {
+      observer = new IntersectionObserver(
+        (entries) => {
+          // Prioritaskan: visible + top paling mendekati 0 (paling dekat header)
+          const visible = entries.filter((e) => e.isIntersecting);
+          if (!visible.length) {
+            lastObservedId = null;
+            onScroll(); // fallback agar tidak kosong
+            return;
+          }
+          visible.sort((a, b) => {
+            const ar = a.boundingClientRect;
+            const br = b.boundingClientRect;
+            // Section yang top-nya negatif (sudah melewati header) -> urut berdasarkan bottom terkecil
+            const aTop = Math.max(0, ar.top);
+            const bTop = Math.max(0, br.top);
+            if (aTop !== bTop) return aTop - bTop;
+            return (b.intersectionRatio || 0) - (a.intersectionRatio || 0);
+          });
+          const id = visible[0].target?.id;
+          if (id) {
+            lastObservedId = id;
+            setActive(id);
+          }
+        },
+        buildOptions()
+      );
+      for (const s of sections) observer.observe(s);
+    }
 
     const onResize = () => {
       setHeaderHeightVar();
-      observer.disconnect();
-      for (const s of sections) observer.observe(s);
+      if (observer) {
+        try {
+          observer.disconnect();
+        } catch (_) { /* noop */ }
+        // Re-observe all dengan opsi baru
+        const newOpts = buildOptions();
+        observer = new IntersectionObserver(observer.takeRecords ? observer.root : null, newOpts);
+        for (const s of sections) observer.observe(s);
+      }
+      onScroll(); // re-detect setelah dimensi berubah
     };
 
+    // Kombinasi observer + scroll fallback agar 100% reliable pada semua kasus
+    window.addEventListener('scroll', onScroll, { passive: true });
     window.addEventListener('resize', onResize, { passive: true });
+    if (typeof window !== 'undefined') window.addEventListener('load', onScroll, { once: true });
+
+    // Deteksi awal
+    onScroll();
   };
 
   const initToTop = () => {
@@ -245,8 +356,6 @@
 
   const initDocLinks = () => {
     const links = Array.from(document.querySelectorAll('[data-doc-link]'));
-    const embedDetails = document.querySelector('[data-embed]');
-    const embedFrame = embedDetails?.querySelector('iframe');
 
     const setSelected = (activeEl) => {
       if (!(activeEl instanceof Element)) return;
@@ -256,7 +365,9 @@
       activeEl.classList.add('is-selected');
     };
 
-    const setEmbed = (src, title) => {
+    const setEmbed = (scope, src, title) => {
+      const embedDetails = scope.querySelector('[data-embed]');
+      const embedFrame = embedDetails?.querySelector('iframe');
       if (!(embedFrame instanceof HTMLIFrameElement)) return;
       if (!src) return;
 
@@ -274,13 +385,14 @@
       a.addEventListener('click', (e) => {
         setSelected(a);
 
+        const scope = a.closest('.docs') || document;
         const embedSrc = a.getAttribute('data-embed-src') || '';
         const embedTitle = a.getAttribute('data-embed-title') || a.textContent?.trim() || '';
         const href = a.getAttribute('href');
 
         if (embedSrc) {
           e.preventDefault();
-          setEmbed(embedSrc, embedTitle);
+          setEmbed(scope, embedSrc, embedTitle);
           return;
         }
 
